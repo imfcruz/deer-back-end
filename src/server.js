@@ -9,9 +9,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+
+
+const supabaseUrl = 'https://uqcufnmysnxvmhgyphks.supabase.co'; 
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVxY3Vmbm15c254dm1oZ3lwaGtzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4ODIyNjQsImV4cCI6MjA5MTQ1ODI2NH0.v7UhfK1-TzP0c0mqC0ae9_Vh0ig1w5I-ZVoiMFtfusU'; 
 const supabase = createClient(supabaseUrl, supabaseKey);
+//const supabaseUrl = process.env.SUPABASE_URL;
+//const supabaseKey = process.env.SUPABASE_KEY;
+//const supabase = createClient(supabaseUrl, supabaseKey);
 const SALT_ROUNDS = 10;
 
 // As funções abaixo padronizam documentos antes de salvar ou comparar no banco.
@@ -457,6 +462,72 @@ app.delete('/usuarios/:id', async (req, res) => {
         res.json({ mensagem: "Conta excluída com sucesso." });
     } catch (error) {
         console.error("Erro ao excluir:", error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+//Rota da Tabela de Pedidos de criação de perfil ONG
+//criando rota para o endereço especificado('/admin/instituicoes-pendentes')
+app.get('/admin/instituicoes-pendentes', async (req, res) => {
+    
+    try {
+        // Busca no supabase a tabela instituição
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .select('*')
+            .eq('status', 'pendente'); // Filtra para trazer só as pendentes
+
+        // Se der algum erro no banco de dados, interrompe e vai para o 'catch'
+        if (error) throw error;
+
+        // Envia o Dados devolta para o Front-End em formato JSON
+        res.json(data);
+
+    } catch (error) {
+        // Mensagem de Erro
+        console.error('Erro na cozinha:', error.message);
+        res.status(500).json({ error: 'Erro interno ao buscar as ONGs.' });
+    }
+});
+
+// Rota para Aprovar a ONG
+app.put('/admin/instituicoes/:id/aprovar', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Atualiza o status para 'aprovada' no Supabase
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .update({ status: 'aprovada' })
+            .eq('id', Number(id))
+            .select();
+
+        if (error) throw error;
+
+        res.json({ mensagem: 'Instituição aprovada com sucesso!', data });
+    } catch (error) {
+        console.error('Erro ao aprovar instituição:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Rota para Recusar a ONG
+app.put('/admin/instituicoes/:id/recusar', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Atualiza o status para 'rejeitada' no Supabase
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .update({ status: 'rejeitada' })
+            .eq('id', Number(id))
+            .select();
+
+        if (error) throw error;
+
+        res.json({ mensagem: 'Instituição rejeitada com sucesso!', data });
+    } catch (error) {
+        console.error('Erro ao rejeitar instituição:', error.message);
         res.status(400).json({ error: error.message });
     }
 });
