@@ -9,6 +9,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -121,47 +123,36 @@ app.post('/login', async (req, res) => {
     const { email, cpf, senha } = req.body;
 
     try {
-        let query = supabase.from('Usuario').select('*');
+        
+        let { data: usuarios, error } = await supabase.from('Usuario').select('*').eq('email', email);
+        let usuarioEncontrado = usuarios && usuarios.length > 0 ? usuarios[0] : null;
+        let tipoUsuario = 'comum';
 
-        if (cpf) {
-            const cpfLimpo = limparCPF(cpf);
-            const cpfFormatado = formatarCPF(cpfLimpo);
-
-            // Aceita CPFs novos salvos sem máscara e contas antigas salvas com máscara.
-            query = query.in('cpf', [cpfLimpo, cpfFormatado]);
-        } else if (email) {
-            // login por email
-            query = query.eq('email', email);
-        } else {
-            return res.status(400).json({ error: 'Informe e-mail ou CPF.' });
+        
+        if (!usuarioEncontrado) {
+            let { data: admins, error: erroAdmin } = await supabase.from('administrador').select('*').eq('email', email);
+            
+            if (admins && admins.length > 0) {
+                usuarioEncontrado = admins[0];
+                tipoUsuario = 'administrador'; // Salvamos que ele é admin!
+            }
         }
 
-        const { data: usuarios, error } = await query;
-
-        if (error) throw error;
-
-        if (!usuarios || usuarios.length === 0) {
+        
+        if (!usuarioEncontrado) {
             return res.status(401).json({ error: 'Nenhuma conta encontrada com esses dados.' });
         }
 
-        const usuario = usuarios[0];
-
-        const senhaCorreta = await conferirSenha(senha, usuario.senha);
+        
+        const senhaCorreta = await conferirSenha(senha, usuarioEncontrado.senha);
         if (!senhaCorreta) {
             return res.status(401).json({ error: 'Senha incorreta. Tente novamente.' });
         }
 
-        if (!senhaEstaCriptografada(usuario.senha)) {
-            const senhaCriptografada = await bcrypt.hash(senha, SALT_ROUNDS);
-            const { error: erroMigracao } = await supabase
-                .from('Usuario')
-                .update({ senha: senhaCriptografada })
-                .eq('id', usuario.id);
-            if (erroMigracao) throw erroMigracao;
-            usuario.senha = senhaCriptografada;
-        }
+        
+        usuarioEncontrado.tipo = tipoUsuario;
 
-        res.json({ message: "Login realizado!", usuario: removerSenhaDoUsuario(usuario) });
+        res.json({ message: "Login realizado!", usuario: removerSenhaDoUsuario(usuarioEncontrado) });
 
     } catch (error) {
         console.error("Erro no login:", error.message);
@@ -173,13 +164,28 @@ app.get('/usuarios/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        const { data, error } = await supabase
+        let { data, error } = await supabase
             .from('Usuario')
             .select('*')
             .eq('id', Number(id))
             .maybeSingle();
 
         if (error) throw error;
+
+        if (!data) {
+            const { data: dataAdmin, error: erroAdmin } = await supabase
+                .from('administrador')
+                .select('*')
+                .eq('id', Number(id))
+                .maybeSingle();
+            
+            if (erroAdmin) throw erroAdmin;
+            
+            if (dataAdmin) {
+                data = dataAdmin;
+                data.tipo = 'administrador'; // Injeta a etiqueta VIP
+            }
+        }
 
         if (!data) {
             return res.status(404).json({ error: 'Usuário não encontrado.' });
@@ -457,6 +463,92 @@ app.delete('/usuarios/:id', async (req, res) => {
         res.json({ mensagem: "Conta excluída com sucesso." });
     } catch (error) {
         console.error("Erro ao excluir:", error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Middleware de Segurança no Servidor
+const verificarSeEAdmin = (req, res, next) => {
+    // Imagine que pegamos o tipo do usuário que veio na requisição
+    const tipoUsuario = req.headers['tipo-usuario']; 
+
+    if (tipoUsuario === 'administrador') {
+        // Se for admin, o "segurança" abre a porta
+        next(); 
+    } else {
+        // Se não for, o servidor responde com erro 403 (Proibido)
+        // O servidor não usa alert(), ele envia um status de erro
+        res.status(403).json({ erro: "Acesso negado. Apenas administradores." });
+    }
+};
+
+// Como aplicar o middleware em uma rota específica
+app.get('/admin/dados-sensiveis', verificarSeEAdmin, (req, res) => {
+    res.json({ mensagem: "Bem-vindo, Administrador! Aqui estão os dados." });
+});
+
+//Rota da Tabela de Pedidos de criação de perfil ONG
+//criando rota para o endereço especificado('/admin/instituicoes-pendentes')
+app.get('/admin/instituicoes-pendentes', verificarSeEAdmin, async (req, res) => {
+    
+    try {
+        // Busca no supabase a tabela instituição
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .select('*')
+            .eq('status', 'pendente'); // Filtra para trazer só as pendentes
+
+        // Se der algum erro no banco de dados, interrompe e vai para o 'catch'
+        if (error) throw error;
+
+        // Envia o Dados devolta para o Front-End em formato JSON
+        res.json(data);
+
+    } catch (error) {
+        // Mensagem de Erro
+        console.error('Erro na cozinha:', error.message);
+        res.status(500).json({ error: 'Erro interno ao buscar as ONGs.' });
+    }
+});
+
+// Rota para Aprovar a ONG
+app.put('/admin/instituicoes/:id/aprovar', verificarSeEAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Atualiza o status para 'aprovada' no Supabase
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .update({ status: 'aprovada' })
+            .eq('id', Number(id))
+            .select();
+
+        if (error) throw error;
+
+        res.json({ mensagem: 'Instituição aprovada com sucesso!', data });
+    } catch (error) {
+        console.error('Erro ao aprovar instituição:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Rota para Recusar a ONG
+app.put('/admin/instituicoes/:id/recusar', verificarSeEAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Atualiza o status para 'rejeitada' no Supabase
+        const { data, error } = await supabase
+            .from('Instituicao')
+            .update({ status: 'rejeitada' })
+            .eq('id', Number(id))
+            .select();
+
+        if (error) throw error;
+
+        res.json({ mensagem: 'Instituição rejeitada com sucesso!', data });
+    } catch (error) {
+        console.error('Erro ao rejeitar instituição:', error.message);
         res.status(400).json({ error: error.message });
     }
 });
