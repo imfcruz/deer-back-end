@@ -654,7 +654,7 @@ app.post('/pagamentos/preferencia', async (req, res) => {
 
         res.status(201).json({
             id: preference.id,
-            checkout_url: preference.sandbox_init_point || preference.init_point
+            checkout_url: preference.init_point || preference.sandbox_init_point
         });
     } catch (error) {
         console.error('Erro ao criar preferência de pagamento:', error.message);
