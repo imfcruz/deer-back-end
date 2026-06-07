@@ -3,10 +3,22 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
+
+const origensPermitidas = (process.env.FRONTEND_ORIGIN || 'https://projeto-deer.vercel.app,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5501,http://localhost:5501,http://127.0.0.1:5502,http://localhost:5502,http://localhost:5173')
+    .split(',')
+    .map(origem => origem.trim())
+    .filter(Boolean);
+
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || origensPermitidas.includes(origin)) return callback(null, true);
+        return callback(new Error('Origem não permitida pelo CORS.'));
+    }
+}));
 app.use(express.json());
 
 
@@ -15,6 +27,81 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const SALT_ROUNDS = 10;
+const SESSION_SECRET = process.env.SESSION_SECRET || 'deer-dev-secret-trocar-no-railway';
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 8;
+const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+
+function base64UrlEncode(valor) {
+    return Buffer.from(JSON.stringify(valor)).toString('base64url');
+}
+
+function assinarToken(payloadBase64) {
+    return crypto
+        .createHmac('sha256', SESSION_SECRET)
+        .update(payloadBase64)
+        .digest('base64url');
+}
+
+function gerarToken(usuario, tipo = 'comum') {
+    const payload = {
+        id: Number(usuario.id),
+        email: usuario.email,
+        tipo,
+        exp: Date.now() + TOKEN_TTL_MS
+    };
+    const payloadBase64 = base64UrlEncode(payload);
+    return `${payloadBase64}.${assinarToken(payloadBase64)}`;
+}
+
+function validarToken(token = '') {
+    try {
+        const [payloadBase64, assinatura] = token.split('.');
+        if (!payloadBase64 || !assinatura) return null;
+
+        const assinaturaEsperada = assinarToken(payloadBase64);
+        if (assinatura.length !== assinaturaEsperada.length) return null;
+        const assinaturaOk = crypto.timingSafeEqual(
+            Buffer.from(assinatura),
+            Buffer.from(assinaturaEsperada)
+        );
+        if (!assinaturaOk) return null;
+
+        const payload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8'));
+        if (!payload.exp || payload.exp < Date.now()) return null;
+        return payload;
+    } catch {
+        return null;
+    }
+}
+
+function autenticar(req, res, next) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    const usuario = validarToken(token);
+
+    if (!usuario) {
+        return res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
+    }
+
+    req.usuario = usuario;
+    next();
+}
+
+function exigirAdmin(req, res, next) {
+    if (req.usuario?.tipo === 'administrador') return next();
+    return res.status(403).json({ error: 'Acesso negado. Apenas administradores.' });
+}
+
+function exigirMesmoUsuarioOuAdmin(req, res, next) {
+    const id = Number(req.params.id || req.params.usuarioId);
+    if (req.usuario?.tipo === 'administrador' || Number(req.usuario?.id) === id) return next();
+    return res.status(403).json({ error: 'Você não tem permissão para acessar estes dados.' });
+}
+
+function origemPrincipalFrontend() {
+    const origemHttps = origensPermitidas.find(origem => origem.startsWith('https://'));
+    return origemHttps || 'https://projeto-deer.vercel.app';
+}
 
 // As funções abaixo padronizam documentos antes de salvar ou comparar no banco.
 function limparCPF(cpf = '') {
@@ -102,6 +189,11 @@ app.post('/usuarios', async (req, res) => {
     try {
         const { nome, cpf, email, senha, telefone, cep, rua, bairro, cidade, estado, numero, complemento } = req.body;
         const cpfLimpo = limparCPF(cpf);
+
+        if (!email || !senha || senha.length < 6 || cpfLimpo.length !== 11) {
+            return res.status(400).json({ error: 'Dados de cadastro inválidos.' });
+        }
+
         const senhaCriptografada = await bcrypt.hash(senha, SALT_ROUNDS);
 
         const { data, error } = await supabase
@@ -111,7 +203,12 @@ app.post('/usuarios', async (req, res) => {
 
         if (error) throw error;
 
-        res.status(201).json({ mensagem: "Usuário cadastrado com sucesso!", data: data.map(removerSenhaDoUsuario) });
+        const usuariosSemSenha = data.map(removerSenhaDoUsuario);
+        res.status(201).json({
+            mensagem: "Usuário cadastrado com sucesso!",
+            data: usuariosSemSenha,
+            token: gerarToken(usuariosSemSenha[0])
+        });
     } catch (error) {
         console.error("Erro ao salvar:", error.message);
         res.status(400).json({ error: error.message });
@@ -123,36 +220,71 @@ app.post('/login', async (req, res) => {
     const { email, cpf, senha } = req.body;
 
     try {
-        
-        let { data: usuarios, error } = await supabase.from('Usuario').select('*').eq('email', email);
-        let usuarioEncontrado = usuarios && usuarios.length > 0 ? usuarios[0] : null;
+        let usuarioEncontrado = null;
         let tipoUsuario = 'comum';
 
-        
-        if (!usuarioEncontrado) {
-            let { data: admins, error: erroAdmin } = await supabase.from('administrador').select('*').eq('email', email);
-            
-            if (admins && admins.length > 0) {
-                usuarioEncontrado = admins[0];
-                tipoUsuario = 'administrador'; // Salvamos que ele é admin!
+        if (cpf) {
+            const cpfLimpo = limparCPF(cpf);
+            const cpfFormatado = formatarCPF(cpfLimpo);
+            const { data: usuarios, error } = await supabase
+                .from('Usuario')
+                .select('*')
+                .in('cpf', [cpfLimpo, cpfFormatado]);
+
+            if (error) throw error;
+            usuarioEncontrado = usuarios?.[0] || null;
+        } else if (email) {
+            const { data: usuarios, error } = await supabase
+                .from('Usuario')
+                .select('*')
+                .eq('email', email);
+
+            if (error) throw error;
+            usuarioEncontrado = usuarios?.[0] || null;
+
+            if (!usuarioEncontrado) {
+                const { data: admins, error: erroAdmin } = await supabase
+                    .from('administrador')
+                    .select('*')
+                    .eq('email', email);
+
+                if (erroAdmin) throw erroAdmin;
+
+                if (admins && admins.length > 0) {
+                    usuarioEncontrado = admins[0];
+                    tipoUsuario = 'administrador';
+                }
             }
+        } else {
+            return res.status(400).json({ error: 'Informe e-mail ou CPF.' });
         }
 
-        
         if (!usuarioEncontrado) {
-            return res.status(401).json({ error: 'Nenhuma conta encontrada com esses dados.' });
+            return res.status(401).json({ error: 'E-mail/CPF ou senha incorretos.' });
         }
 
-        
         const senhaCorreta = await conferirSenha(senha, usuarioEncontrado.senha);
         if (!senhaCorreta) {
-            return res.status(401).json({ error: 'Senha incorreta. Tente novamente.' });
+            return res.status(401).json({ error: 'E-mail/CPF ou senha incorretos.' });
         }
 
-        
+        if (tipoUsuario === 'comum' && !senhaEstaCriptografada(usuarioEncontrado.senha)) {
+            const senhaCriptografada = await bcrypt.hash(senha, SALT_ROUNDS);
+            const { error: erroMigracao } = await supabase
+                .from('Usuario')
+                .update({ senha: senhaCriptografada })
+                .eq('id', usuarioEncontrado.id);
+            if (erroMigracao) throw erroMigracao;
+            usuarioEncontrado.senha = senhaCriptografada;
+        }
+
         usuarioEncontrado.tipo = tipoUsuario;
 
-        res.json({ message: "Login realizado!", usuario: removerSenhaDoUsuario(usuarioEncontrado) });
+        res.json({
+            message: "Login realizado!",
+            usuario: removerSenhaDoUsuario(usuarioEncontrado),
+            token: gerarToken(usuarioEncontrado, tipoUsuario)
+        });
 
     } catch (error) {
         console.error("Erro no login:", error.message);
@@ -160,7 +292,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-app.get('/usuarios/:id', async (req, res) => {
+app.get('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
@@ -199,7 +331,7 @@ app.get('/usuarios/:id', async (req, res) => {
 });
 
 // Update do perfil: aceita só os campos enviados, então o front pode salvar dados em partes.
-app.put('/usuarios/:id', async (req, res) => {
+app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
@@ -222,8 +354,19 @@ app.put('/usuarios/:id', async (req, res) => {
         if (estado !== undefined)      dadosParaAtualizar.estado = estado;
         if (numero !== undefined)      dadosParaAtualizar.numero = numero;
         if (complemento !== undefined) dadosParaAtualizar.complemento = complemento;
-        if (perfil_url !== undefined)  dadosParaAtualizar.perfil_url = perfil_url;
-        if (banner_cor !== undefined)  dadosParaAtualizar.banner_cor = banner_cor;
+        if (perfil_url !== undefined) {
+            const urlPerfil = String(perfil_url || '');
+            if (urlPerfil && !urlPerfil.startsWith(`${supabaseUrl}/storage/v1/object/public/`)) {
+                return res.status(400).json({ error: "URL de perfil inválida." });
+            }
+            dadosParaAtualizar.perfil_url = perfil_url;
+        }
+        if (banner_cor !== undefined) {
+            if (!/^#[0-9A-Fa-f]{6}$/.test(String(banner_cor))) {
+                return res.status(400).json({ error: "Cor do banner inválida." });
+            }
+            dadosParaAtualizar.banner_cor = banner_cor;
+        }
         if (biografia !== undefined)   dadosParaAtualizar.biografia = biografia;
         if (tema_preferido !== undefined) {
             if (!['claro', 'escuro'].includes(tema_preferido)) {
@@ -247,7 +390,60 @@ app.put('/usuarios/:id', async (req, res) => {
     }
 });
 
-app.post('/instituicoes', async (req, res) => {
+app.post('/usuarios/:id/foto', autenticar, exigirMesmoUsuarioOuAdmin, express.raw({
+    type: ['image/jpeg', 'image/png', 'image/webp'],
+    limit: '2mb'
+}), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const tipoArquivo = req.headers['content-type'];
+        const extensoes = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/webp': 'webp'
+        };
+
+        if (!extensoes[tipoArquivo] || !req.body?.length) {
+            return res.status(400).json({ error: 'Arquivo de imagem inválido.' });
+        }
+
+        const caminhoArquivo = `avatares/${Number(id)}.${extensoes[tipoArquivo]}`;
+        const respostaUpload = await fetch(
+            `${supabaseUrl}/storage/v1/object/imagens/${caminhoArquivo}`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${supabaseKey}`,
+                    'Content-Type': tipoArquivo,
+                    'x-upsert': 'true'
+                },
+                body: req.body
+            }
+        );
+
+        if (!respostaUpload.ok) {
+            const erroUpload = await respostaUpload.text();
+            console.error('Erro no upload do Supabase:', erroUpload);
+            return res.status(400).json({ error: 'Erro ao enviar foto.' });
+        }
+
+        const urlFoto = `${supabaseUrl}/storage/v1/object/public/imagens/${caminhoArquivo}?t=${Date.now()}`;
+        const { data, error } = await supabase
+            .from('Usuario')
+            .update({ perfil_url: urlFoto })
+            .eq('id', Number(id))
+            .select();
+
+        if (error) throw error;
+
+        res.json({ mensagem: 'Foto atualizada com sucesso.', perfil_url: urlFoto, data: data.map(removerSenhaDoUsuario) });
+    } catch (error) {
+        console.error('Erro ao atualizar foto:', error.message);
+        res.status(400).json({ error: 'Erro ao atualizar foto.' });
+    }
+});
+
+app.post('/instituicoes', autenticar, async (req, res) => {
     try {
         const {
             usuario_id, cnpj, razao_social, nome_fantasia, nome_publico,
@@ -256,7 +452,9 @@ app.post('/instituicoes', async (req, res) => {
             logo_url, banner_url, chave_pix, tipo_chave_pix, observacao_endereco
         } = req.body;
 
-        if (!usuario_id) {
+        const usuarioIdAutenticado = req.usuario.id;
+
+        if (!usuarioIdAutenticado) {
             return res.status(400).json({ error: 'Usuário não informado.' });
         }
 
@@ -299,7 +497,7 @@ app.post('/instituicoes', async (req, res) => {
         const { data: existente, error: erroBusca } = await supabase
             .from('Instituicao')
             .select('id, status')
-            .eq('usuario_id', Number(usuario_id))
+            .eq('usuario_id', Number(usuarioIdAutenticado))
             .maybeSingle();
 
         if (erroBusca) throw erroBusca;
@@ -309,7 +507,7 @@ app.post('/instituicoes', async (req, res) => {
         }
 
         const dadosInstituicao = {
-            usuario_id: Number(usuario_id),
+            usuario_id: Number(usuarioIdAutenticado),
             cnpj: cnpjLimpo,
             razao_social,
             nome_fantasia,
@@ -354,7 +552,7 @@ app.get('/instituicoes', async (req, res) => {
         // A listagem pública mostra apenas instituições aprovadas.
         const { data, error } = await supabase
             .from('Instituicao')
-            .select('*')
+            .select('id, cnpj, razao_social, nome_fantasia, nome_publico, situacao_cadastral, descricao, categorias_aceitas, cidade, estado, logo_url, banner_url, created_at')
             .eq('status', 'aprovada')
             .order('created_at', { ascending: false });
 
@@ -367,7 +565,7 @@ app.get('/instituicoes', async (req, res) => {
     }
 });
 
-app.get('/instituicoes/usuario/:usuarioId', async (req, res) => {
+app.get('/instituicoes/usuario/:usuarioId', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { usuarioId } = req.params;
 
@@ -386,10 +584,87 @@ app.get('/instituicoes/usuario/:usuarioId', async (req, res) => {
     }
 });
 
-app.delete('/instituicoes/:id', async (req, res) => {
+app.post('/pagamentos/preferencia', async (req, res) => {
+    try {
+        if (!MERCADO_PAGO_ACCESS_TOKEN) {
+            return res.status(500).json({ error: 'Mercado Pago não configurado no servidor.' });
+        }
+
+        const instituicaoId = Number(req.body.instituicao_id);
+        const valor = Number(req.body.valor);
+
+        if (!instituicaoId || !Number.isFinite(valor) || valor < 1 || valor > 10000) {
+            return res.status(400).json({ error: 'Informe um valor de doação válido.' });
+        }
+
+        const { data: instituicao, error: erroInstituicao } = await supabase
+            .from('Instituicao')
+            .select('id, nome_publico, razao_social, status')
+            .eq('id', instituicaoId)
+            .eq('status', 'aprovada')
+            .maybeSingle();
+
+        if (erroInstituicao) throw erroInstituicao;
+
+        if (!instituicao) {
+            return res.status(404).json({ error: 'Instituição aprovada não encontrada.' });
+        }
+
+        const origem = origemPrincipalFrontend();
+        const nomeInstituicao = instituicao.nome_publico || instituicao.razao_social || 'Instituição parceira';
+
+        const preferencePayload = {
+            items: [
+                {
+                    title: `Doação para ${nomeInstituicao}`,
+                    description: 'Simulação de doação pela plataforma DEER',
+                    quantity: 1,
+                    currency_id: 'BRL',
+                    unit_price: Number(valor.toFixed(2))
+                }
+            ],
+            back_urls: {
+                success: `${origem}/pages/ongs.html?pagamento=sucesso`,
+                failure: `${origem}/pages/ongs.html?pagamento=falha`,
+                pending: `${origem}/pages/ongs.html?pagamento=pendente`
+            },
+            auto_return: 'approved',
+            external_reference: `deer-${instituicao.id}-${Date.now()}`,
+            metadata: {
+                instituicao_id: instituicao.id,
+                ambiente: 'sandbox'
+            }
+        };
+
+        const resposta = await fetch('https://api.mercadopago.com/checkout/preferences', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(preferencePayload)
+        });
+
+        const preference = await resposta.json();
+
+        if (!resposta.ok) {
+            console.error('Erro Mercado Pago:', preference);
+            return res.status(400).json({ error: 'Não foi possível iniciar o checkout de pagamento.' });
+        }
+
+        res.status(201).json({
+            id: preference.id,
+            checkout_url: preference.sandbox_init_point || preference.init_point
+        });
+    } catch (error) {
+        console.error('Erro ao criar preferência de pagamento:', error.message);
+        res.status(400).json({ error: 'Erro ao criar preferência de pagamento.' });
+    }
+});
+
+app.delete('/instituicoes/:id', autenticar, async (req, res) => {
     try {
         const { id } = req.params;
-        const { usuario_id } = req.body;
 
         const { data: instituicao, error: erroBusca } = await supabase
             .from('Instituicao')
@@ -404,7 +679,7 @@ app.delete('/instituicoes/:id', async (req, res) => {
         }
 
         // Garante que um usuário não cancele a solicitação de outro perfil.
-        if (Number(instituicao.usuario_id) !== Number(usuario_id)) {
+        if (req.usuario.tipo !== 'administrador' && Number(instituicao.usuario_id) !== Number(req.usuario.id)) {
             return res.status(403).json({ error: 'Você não pode cancelar esta solicitação.' });
         }
 
@@ -427,10 +702,14 @@ app.delete('/instituicoes/:id', async (req, res) => {
 });
 
 // Exclusão de conta: exige a senha novamente antes de apagar o usuário.
-app.delete('/usuarios/:id', async (req, res) => {
+app.delete('/usuarios/:id', autenticar, async (req, res) => {
     try {
         const { id } = req.params;
         const { senha } = req.body;
+
+        if (Number(req.usuario.id) !== Number(id) || req.usuario.tipo !== 'comum') {
+            return res.status(403).json({ error: 'Você não tem permissão para excluir esta conta.' });
+        }
 
         if (!senha) {
             return res.status(400).json({ error: "Informe sua senha para excluir a conta." });
@@ -467,20 +746,8 @@ app.delete('/usuarios/:id', async (req, res) => {
     }
 });
 
-// Middleware de Segurança no Servidor
-const verificarSeEAdmin = (req, res, next) => {
-    // Imagine que pegamos o tipo do usuário que veio na requisição
-    const tipoUsuario = req.headers['tipo-usuario']; 
-
-    if (tipoUsuario === 'administrador') {
-        // Se for admin, o "segurança" abre a porta
-        next(); 
-    } else {
-        // Se não for, o servidor responde com erro 403 (Proibido)
-        // O servidor não usa alert(), ele envia um status de erro
-        res.status(403).json({ erro: "Acesso negado. Apenas administradores." });
-    }
-};
+// Rotas administrativas exigem token válido e usuário marcado como administrador pelo back-end.
+const verificarSeEAdmin = [autenticar, exigirAdmin];
 
 // Como aplicar o middleware em uma rota específica
 app.get('/admin/dados-sensiveis', verificarSeEAdmin, (req, res) => {
