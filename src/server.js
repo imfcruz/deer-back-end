@@ -1,5 +1,7 @@
 require('dotenv').config();
 
+// Dependencias principais do servidor. O Express cria as rotas, o Supabase acessa o banco
+// e as bibliotecas de seguranca cuidam de senha e token de sessao.
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -8,6 +10,8 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
+// Lista de origens que podem chamar a API. Em producao, o front hospedado no Vercel
+// fica em FRONTEND_ORIGIN; os localhost ficam para testes durante o desenvolvimento.
 const origensPermitidas = (process.env.FRONTEND_ORIGIN || 'https://projeto-deer.vercel.app,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:5501,http://localhost:5501,http://127.0.0.1:5502,http://localhost:5502,http://localhost:5173')
     .split(',')
     .map(origem => origem.trim())
@@ -15,6 +19,7 @@ const origensPermitidas = (process.env.FRONTEND_ORIGIN || 'https://projeto-deer.
 
 app.use(cors({
     origin(origin, callback) {
+        // Requisicoes sem origin, como alguns testes locais, tambem sao aceitas.
         if (!origin || origensPermitidas.includes(origin)) return callback(null, true);
         return callback(new Error('Origem não permitida pelo CORS.'));
     }
@@ -22,19 +27,21 @@ app.use(cors({
 app.use(express.json());
 
 
-
+// Variaveis sensiveis ficam fora do GitHub e sao configuradas no Railway.
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const SALT_ROUNDS = 10;
-const SESSION_SECRET = process.env.SESSION_SECRET || 'deer-dev-secret-trocar-no-railway';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'deer-local-session-secret';
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 8;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
 
+// Transforma o conteudo do token em base64url, formato seguro para usar em headers e URLs.
 function base64UrlEncode(valor) {
     return Buffer.from(JSON.stringify(valor)).toString('base64url');
 }
 
+// Assina o token com uma chave secreta. Se alguem alterar o payload, a assinatura deixa de bater.
 function assinarToken(payloadBase64) {
     return crypto
         .createHmac('sha256', SESSION_SECRET)
@@ -42,6 +49,7 @@ function assinarToken(payloadBase64) {
         .digest('base64url');
 }
 
+// Cria um token simples para o front enviar nas proximas requisicoes protegidas.
 function gerarToken(usuario, tipo = 'comum') {
     const payload = {
         id: Number(usuario.id),
@@ -53,6 +61,7 @@ function gerarToken(usuario, tipo = 'comum') {
     return `${payloadBase64}.${assinarToken(payloadBase64)}`;
 }
 
+// Confere se o token veio bem formado, se a assinatura esta correta e se ele ainda nao expirou.
 function validarToken(token = '') {
     try {
         const [payloadBase64, assinatura] = token.split('.');
@@ -74,6 +83,7 @@ function validarToken(token = '') {
     }
 }
 
+// Middleware usado nas rotas que exigem login. Ele coloca os dados do token em req.usuario.
 function autenticar(req, res, next) {
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : '';
@@ -87,27 +97,32 @@ function autenticar(req, res, next) {
     next();
 }
 
+// Middleware usado no painel administrativo.
 function exigirAdmin(req, res, next) {
     if (req.usuario?.tipo === 'administrador') return next();
     return res.status(403).json({ error: 'Acesso negado. Apenas administradores.' });
 }
 
+// Garante que um usuario comum so acesse seus proprios dados; administradores podem acessar qualquer id.
 function exigirMesmoUsuarioOuAdmin(req, res, next) {
     const id = Number(req.params.id || req.params.usuarioId);
     if (req.usuario?.tipo === 'administrador' || Number(req.usuario?.id) === id) return next();
     return res.status(403).json({ error: 'Você não tem permissão para acessar estes dados.' });
 }
 
+// Usado pelo Mercado Pago para montar os links de retorno depois do pagamento.
 function origemPrincipalFrontend() {
     const origemHttps = origensPermitidas.find(origem => origem.startsWith('https://'));
     return origemHttps || 'https://projeto-deer.vercel.app';
 }
 
-// As funções abaixo padronizam documentos antes de salvar ou comparar no banco.
+// Padroniza documentos antes de salvar ou comparar no banco. Assim CPF/CNPJ com mascara
+// e sem mascara continuam sendo tratados como o mesmo dado.
 function limparCPF(cpf = '') {
     return String(cpf).replace(/\D/g, '');
 }
 
+// Mantemos esse formato para conseguir comparar com registros antigos que foram salvos com mascara.
 function formatarCPF(cpf = '') {
     const cpfLimpo = limparCPF(cpf);
     if (cpfLimpo.length !== 11) return cpf;
@@ -122,6 +137,7 @@ function limparTelefone(telefone = '') {
     return String(telefone).replace(/\D/g, '');
 }
 
+// A instituicao informa Pix no formulario do front. O back valida de novo porque o front pode ser burlado.
 function validarChavePix(tipo, chave) {
     const valor = String(chave || '').trim();
     if (!valor) return 'Informe a chave Pix.';
@@ -152,11 +168,13 @@ function validarChavePix(tipo, chave) {
     return '';
 }
 
-// Permite migrar contas antigas: senha nova fica com hash, mas senha antiga em texto ainda loga uma vez.
+// Identifica se a senha salva ja esta em formato bcrypt.
 function senhaEstaCriptografada(senha = '') {
     return typeof senha === 'string' && /^\$2[aby]\$\d{2}\$/.test(senha);
 }
 
+// Compara a senha digitada com o que esta no banco. Se for hash, usa bcrypt;
+// se for registro antigo em texto puro, compara diretamente para permitir migracao.
 async function conferirSenha(senhaDigitada, senhaSalva) {
     if (!senhaSalva) return false;
     if (senhaEstaCriptografada(senhaSalva)) {
@@ -165,6 +183,7 @@ async function conferirSenha(senhaDigitada, senhaSalva) {
     return senhaDigitada === senhaSalva;
 }
 
+// Nunca devolvemos senha para o front-end, nem hash. O front so precisa dos dados de perfil.
 function removerSenhaDoUsuario(usuario) {
     if (!usuario) return usuario;
     const { senha, ...usuarioSemSenha } = usuario;
@@ -182,9 +201,11 @@ const categoriasPermitidas = [
     'moveis'
 ];
 
+// Mesma ideia das categorias: o banco so recebe tipos de chave Pix conhecidos.
 const tiposPixPermitidos = ['cpf', 'cnpj', 'email', 'telefone', 'aleatoria'];
 
-// Cadastro de usuário: cria a conta já guardando a senha com bcrypt.
+// Cadastro de usuario. O front manda os dados do formulario e esta rota salva no Supabase.
+// A senha ja entra no banco como hash, entao a senha real nao fica guardada.
 app.post('/usuarios', async (req, res) => {
     try {
         const { nome, cpf, email, senha, telefone, cep, rua, bairro, cidade, estado, numero, complemento } = req.body;
@@ -196,6 +217,7 @@ app.post('/usuarios', async (req, res) => {
 
         const senhaCriptografada = await bcrypt.hash(senha, SALT_ROUNDS);
 
+        // Insere na tabela Usuario e devolve o registro criado para iniciar a sessao no front.
         const { data, error } = await supabase
             .from('Usuario')
             .insert([{ nome, cpf: cpfLimpo, email, senha: senhaCriptografada, telefone, cep, rua, bairro, cidade, estado, numero, complemento }])
@@ -207,6 +229,7 @@ app.post('/usuarios', async (req, res) => {
         res.status(201).json({
             mensagem: "Usuário cadastrado com sucesso!",
             data: usuariosSemSenha,
+            // O token permite que o usuario ja entre logado depois do cadastro.
             token: gerarToken(usuariosSemSenha[0])
         });
     } catch (error) {
@@ -215,7 +238,7 @@ app.post('/usuarios', async (req, res) => {
     }
 });
 
-// Login: aceita email ou CPF e remove a senha antes de devolver os dados ao front.
+// Login: aceita email ou CPF. Se for administrador, a busca tambem passa pela tabela administrador.
 app.post('/login', async (req, res) => {
     const { email, cpf, senha } = req.body;
 
@@ -224,6 +247,7 @@ app.post('/login', async (req, res) => {
         let tipoUsuario = 'comum';
 
         if (cpf) {
+            // CPF pode chegar com ou sem mascara, por isso a busca considera os dois formatos.
             const cpfLimpo = limparCPF(cpf);
             const cpfFormatado = formatarCPF(cpfLimpo);
             const { data: usuarios, error } = await supabase
@@ -243,6 +267,7 @@ app.post('/login', async (req, res) => {
             usuarioEncontrado = usuarios?.[0] || null;
 
             if (!usuarioEncontrado) {
+                // Administradores entram por e-mail e recebem token com tipo administrador.
                 const { data: admins, error: erroAdmin } = await supabase
                     .from('administrador')
                     .select('*')
@@ -268,6 +293,7 @@ app.post('/login', async (req, res) => {
             return res.status(401).json({ error: 'E-mail/CPF ou senha incorretos.' });
         }
 
+        // Se uma conta antiga ainda estava com senha em texto puro, o login corrige isso automaticamente.
         if (tipoUsuario === 'comum' && !senhaEstaCriptografada(usuarioEncontrado.senha)) {
             const senhaCriptografada = await bcrypt.hash(senha, SALT_ROUNDS);
             const { error: erroMigracao } = await supabase
@@ -283,6 +309,7 @@ app.post('/login', async (req, res) => {
         res.json({
             message: "Login realizado!",
             usuario: removerSenhaDoUsuario(usuarioEncontrado),
+            // O front salva esse token e envia nas rotas protegidas pelo header Authorization.
             token: gerarToken(usuarioEncontrado, tipoUsuario)
         });
 
@@ -292,6 +319,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
+// Busca os dados do usuario logado. O middleware impede consultar outro perfil sem permissao.
 app.get('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -315,7 +343,7 @@ app.get('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
             
             if (dataAdmin) {
                 data = dataAdmin;
-                data.tipo = 'administrador'; // Injeta a etiqueta VIP
+                data.tipo = 'administrador';
             }
         }
 
@@ -330,7 +358,7 @@ app.get('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
     }
 });
 
-// Update do perfil: aceita só os campos enviados, então o front pode salvar dados em partes.
+// Atualizacao do perfil. Aceita apenas os campos enviados, entao o front consegue salvar dados em partes.
 app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { id } = req.params;
@@ -343,6 +371,7 @@ app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
 
         const dadosParaAtualizar = {};
 
+        // Cada campo so entra no update se veio no corpo da requisicao.
         if (nome !== undefined)        dadosParaAtualizar.nome = nome;
         if (telefone !== undefined)    dadosParaAtualizar.telefone = telefone;
         if (email !== undefined)       dadosParaAtualizar.email = email;
@@ -355,6 +384,7 @@ app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
         if (numero !== undefined)      dadosParaAtualizar.numero = numero;
         if (complemento !== undefined) dadosParaAtualizar.complemento = complemento;
         if (perfil_url !== undefined) {
+            // Garante que o front nao salve qualquer URL externa como foto de perfil.
             const urlPerfil = String(perfil_url || '');
             if (urlPerfil && !urlPerfil.startsWith(`${supabaseUrl}/storage/v1/object/public/`)) {
                 return res.status(400).json({ error: "URL de perfil inválida." });
@@ -362,6 +392,7 @@ app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
             dadosParaAtualizar.perfil_url = perfil_url;
         }
         if (banner_cor !== undefined) {
+            // O front tambem valida, mas o back precisa repetir para proteger a rota.
             if (!/^#[0-9A-Fa-f]{6}$/.test(String(banner_cor))) {
                 return res.status(400).json({ error: "Cor do banner inválida." });
             }
@@ -369,6 +400,7 @@ app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
         }
         if (biografia !== undefined)   dadosParaAtualizar.biografia = biografia;
         if (tema_preferido !== undefined) {
+            // O tema precisa ser um dos valores combinados com o front-end.
             if (!['claro', 'escuro'].includes(tema_preferido)) {
                 return res.status(400).json({ error: "Tema inválido." });
             }
@@ -390,6 +422,7 @@ app.put('/usuarios/:id', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res)
     }
 });
 
+// Upload de foto do usuario. O front envia o arquivo cru e o back faz o envio ao Storage do Supabase.
 app.post('/usuarios/:id/foto', autenticar, exigirMesmoUsuarioOuAdmin, express.raw({
     type: ['image/jpeg', 'image/png', 'image/webp'],
     limit: '2mb'
@@ -403,11 +436,13 @@ app.post('/usuarios/:id/foto', autenticar, exigirMesmoUsuarioOuAdmin, express.ra
             'image/webp': 'webp'
         };
 
+        // Limita tipo e tamanho do arquivo antes de falar com o Supabase.
         if (!extensoes[tipoArquivo] || !req.body?.length) {
             return res.status(400).json({ error: 'Arquivo de imagem inválido.' });
         }
 
         const caminhoArquivo = `avatares/${Number(id)}.${extensoes[tipoArquivo]}`;
+        // Usamos a chave do Supabase no back-end, nao no front. Isso evita expor configuracoes sensiveis.
         const respostaUpload = await fetch(
             `${supabaseUrl}/storage/v1/object/imagens/${caminhoArquivo}`,
             {
@@ -428,6 +463,7 @@ app.post('/usuarios/:id/foto', autenticar, exigirMesmoUsuarioOuAdmin, express.ra
         }
 
         const urlFoto = `${supabaseUrl}/storage/v1/object/public/imagens/${caminhoArquivo}?t=${Date.now()}`;
+        // Depois do upload, salvamos a URL publica no perfil do usuario.
         const { data, error } = await supabase
             .from('Usuario')
             .update({ perfil_url: urlFoto })
@@ -443,6 +479,7 @@ app.post('/usuarios/:id/foto', autenticar, exigirMesmoUsuarioOuAdmin, express.ra
     }
 });
 
+// Recebe a solicitacao para vincular uma instituicao ao perfil do usuario logado.
 app.post('/instituicoes', autenticar, async (req, res) => {
     try {
         const {
@@ -454,6 +491,7 @@ app.post('/instituicoes', autenticar, async (req, res) => {
 
         const usuarioIdAutenticado = req.usuario.id;
 
+        // Mesmo que o front envie usuario_id, usamos o id do token para evitar falsificacao.
         if (!usuarioIdAutenticado) {
             return res.status(400).json({ error: 'Usuário não informado.' });
         }
@@ -494,6 +532,7 @@ app.post('/instituicoes', autenticar, async (req, res) => {
             return res.status(400).json({ error: erroChavePix });
         }
 
+        // Regra atual: cada usuario pode ter apenas uma instituicao vinculada.
         const { data: existente, error: erroBusca } = await supabase
             .from('Instituicao')
             .select('id, status')
@@ -529,10 +568,12 @@ app.post('/instituicoes', autenticar, async (req, res) => {
             status: 'pendente'
         };
 
+        // Essa observacao aparece para administradores quando o endereco foi corrigido manualmente.
         if (observacao_endereco) {
             dadosInstituicao.observacao_endereco = String(observacao_endereco).trim();
         }
 
+        // A instituicao entra como pendente e so aparece publicamente depois da aprovacao.
         const { data, error } = await supabase
             .from('Instituicao')
             .insert([dadosInstituicao])
@@ -547,9 +588,10 @@ app.post('/instituicoes', autenticar, async (req, res) => {
     }
 });
 
+// Listagem publica usada pela home e pela pagina de instituicoes.
 app.get('/instituicoes', async (req, res) => {
     try {
-        // A listagem pública mostra apenas instituições aprovadas.
+        // Mostra apenas instituicoes aprovadas e apenas campos necessarios para os cards.
         const { data, error } = await supabase
             .from('Instituicao')
             .select('id, cnpj, razao_social, nome_fantasia, nome_publico, situacao_cadastral, descricao, categorias_aceitas, cidade, estado, logo_url, banner_url, created_at')
@@ -565,6 +607,7 @@ app.get('/instituicoes', async (req, res) => {
     }
 });
 
+// Tela de perfil usa esta rota para saber se o usuario ja enviou uma solicitacao de instituicao.
 app.get('/instituicoes/usuario/:usuarioId', autenticar, exigirMesmoUsuarioOuAdmin, async (req, res) => {
     try {
         const { usuarioId } = req.params;
@@ -584,6 +627,8 @@ app.get('/instituicoes/usuario/:usuarioId', autenticar, exigirMesmoUsuarioOuAdmi
     }
 });
 
+// Cria uma preferencia de pagamento no Mercado Pago. O front envia valor e instituicao;
+// o back usa o access token seguro para gerar o link do Checkout Pro.
 app.post('/pagamentos/preferencia', async (req, res) => {
     try {
         if (!MERCADO_PAGO_ACCESS_TOKEN) {
@@ -593,10 +638,12 @@ app.post('/pagamentos/preferencia', async (req, res) => {
         const instituicaoId = Number(req.body.instituicao_id);
         const valor = Number(req.body.valor);
 
+        // Valor simples para a simulacao: minimo de R$1,00 e limite alto para evitar abuso.
         if (!instituicaoId || !Number.isFinite(valor) || valor < 1 || valor > 10000) {
             return res.status(400).json({ error: 'Informe um valor de doação válido.' });
         }
 
+        // Doacoes so podem ser iniciadas para instituicoes aprovadas.
         const { data: instituicao, error: erroInstituicao } = await supabase
             .from('Instituicao')
             .select('id, nome_publico, razao_social, status')
@@ -613,6 +660,7 @@ app.post('/pagamentos/preferencia', async (req, res) => {
         const origem = origemPrincipalFrontend();
         const nomeInstituicao = instituicao.nome_publico || instituicao.razao_social || 'Instituição parceira';
 
+        // Payload esperado pelo Mercado Pago para criar o checkout.
         const preferencePayload = {
             items: [
                 {
@@ -624,6 +672,7 @@ app.post('/pagamentos/preferencia', async (req, res) => {
                 }
             ],
             back_urls: {
+                // Depois do pagamento, o Mercado Pago volta para o front com o status na URL.
                 success: `${origem}/pages/ongs.html?pagamento=sucesso`,
                 failure: `${origem}/pages/ongs.html?pagamento=falha`,
                 pending: `${origem}/pages/ongs.html?pagamento=pendente`
@@ -631,11 +680,13 @@ app.post('/pagamentos/preferencia', async (req, res) => {
             auto_return: 'approved',
             external_reference: `deer-${instituicao.id}-${Date.now()}`,
             metadata: {
+                // Metadata ajuda a identificar a instituicao dentro do painel do Mercado Pago.
                 instituicao_id: instituicao.id,
                 ambiente: 'sandbox'
             }
         };
 
+        // Chamada direta para a API do Mercado Pago usando o token guardado no Railway.
         const resposta = await fetch('https://api.mercadopago.com/checkout/preferences', {
             method: 'POST',
             headers: {
@@ -654,6 +705,7 @@ app.post('/pagamentos/preferencia', async (req, res) => {
 
         res.status(201).json({
             id: preference.id,
+            // O front redireciona o usuario para esse link.
             checkout_url: preference.init_point || preference.sandbox_init_point
         });
     } catch (error) {
@@ -662,6 +714,7 @@ app.post('/pagamentos/preferencia', async (req, res) => {
     }
 });
 
+// Cancela uma solicitacao de instituicao pendente.
 app.delete('/instituicoes/:id', autenticar, async (req, res) => {
     try {
         const { id } = req.params;
@@ -678,7 +731,7 @@ app.delete('/instituicoes/:id', autenticar, async (req, res) => {
             return res.status(404).json({ error: 'Instituição não encontrada.' });
         }
 
-        // Garante que um usuário não cancele a solicitação de outro perfil.
+        // Garante que um usuario nao cancele a solicitacao de outro perfil.
         if (req.usuario.tipo !== 'administrador' && Number(instituicao.usuario_id) !== Number(req.usuario.id)) {
             return res.status(403).json({ error: 'Você não pode cancelar esta solicitação.' });
         }
@@ -701,12 +754,13 @@ app.delete('/instituicoes/:id', autenticar, async (req, res) => {
     }
 });
 
-// Exclusão de conta: exige a senha novamente antes de apagar o usuário.
+// Exclusao de conta: exige a senha novamente antes de apagar o usuario.
 app.delete('/usuarios/:id', autenticar, async (req, res) => {
     try {
         const { id } = req.params;
         const { senha } = req.body;
 
+        // Apenas usuarios comuns podem excluir a propria conta por esta rota.
         if (Number(req.usuario.id) !== Number(id) || req.usuario.tipo !== 'comum') {
             return res.status(403).json({ error: 'Você não tem permissão para excluir esta conta.' });
         }
@@ -727,6 +781,7 @@ app.delete('/usuarios/:id', autenticar, async (req, res) => {
             return res.status(404).json({ error: "Usuário não encontrado." });
         }
 
+        // Confere a senha antes de apagar para evitar exclusao por sessao aberta em outro dispositivo.
         const senhaCorreta = await conferirSenha(senha, usuario.senha);
         if (!senhaCorreta) {
             return res.status(401).json({ error: "Senha incorreta." });
@@ -746,44 +801,41 @@ app.delete('/usuarios/:id', autenticar, async (req, res) => {
     }
 });
 
-// Rotas administrativas exigem token válido e usuário marcado como administrador pelo back-end.
+// Rotas administrativas exigem token valido e usuario marcado como administrador pelo back-end.
 const verificarSeEAdmin = [autenticar, exigirAdmin];
 
-// Como aplicar o middleware em uma rota específica
+// Rota simples para testar se o token de administrador esta funcionando.
 app.get('/admin/dados-sensiveis', verificarSeEAdmin, (req, res) => {
     res.json({ mensagem: "Bem-vindo, Administrador! Aqui estão os dados." });
 });
 
-//Rota da Tabela de Pedidos de criação de perfil ONG
-//criando rota para o endereço especificado('/admin/instituicoes-pendentes')
+// Lista as solicitacoes que aparecem na tabela do painel administrativo.
 app.get('/admin/instituicoes-pendentes', verificarSeEAdmin, async (req, res) => {
     
     try {
-        // Busca no supabase a tabela instituição
+        // Busca no Supabase apenas instituicoes que ainda estao pendentes.
         const { data, error } = await supabase
             .from('Instituicao')
             .select('*')
-            .eq('status', 'pendente'); // Filtra para trazer só as pendentes
+            .eq('status', 'pendente');
 
-        // Se der algum erro no banco de dados, interrompe e vai para o 'catch'
         if (error) throw error;
 
-        // Envia o Dados devolta para o Front-End em formato JSON
+        // O front monta a tabela a partir deste JSON.
         res.json(data);
 
     } catch (error) {
-        // Mensagem de Erro
-        console.error('Erro na cozinha:', error.message);
-        res.status(500).json({ error: 'Erro interno ao buscar as ONGs.' });
+        console.error('Erro ao buscar solicitações pendentes:', error.message);
+        res.status(500).json({ error: 'Erro interno ao buscar as instituições.' });
     }
 });
 
-// Rota para Aprovar a ONG
+// Aprova a instituicao. Depois disso ela passa a aparecer na listagem publica.
 app.put('/admin/instituicoes/:id/aprovar', verificarSeEAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Atualiza o status para 'aprovada' no Supabase
+        // Atualiza o status para aprovada no Supabase.
         const { data, error } = await supabase
             .from('Instituicao')
             .update({ status: 'aprovada' })
@@ -799,12 +851,12 @@ app.put('/admin/instituicoes/:id/aprovar', verificarSeEAdmin, async (req, res) =
     }
 });
 
-// Rota para Recusar a ONG
+// Recusa a solicitacao. Ela deixa de aparecer como pendente para os administradores.
 app.put('/admin/instituicoes/:id/recusar', verificarSeEAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Atualiza o status para 'rejeitada' no Supabase
+        // Atualiza o status para rejeitada no Supabase.
         const { data, error } = await supabase
             .from('Instituicao')
             .update({ status: 'rejeitada' })
@@ -822,5 +874,6 @@ app.put('/admin/instituicoes/:id/recusar', verificarSeEAdmin, async (req, res) =
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+    // No Railway a porta vem por variavel de ambiente. Localmente, usamos 3000.
     console.log(`Servidor ativo na porta ${PORT}`);
 });
